@@ -1,0 +1,4 @@
+gradio[mcp]>=5.28
+fastapi
+uvicorn
+requests
