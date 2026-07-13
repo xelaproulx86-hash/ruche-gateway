@@ -282,7 +282,73 @@ def _web_get(url: str, max_redirects: int = 5) -> str:
         return rr.text[:3000]
     return "URL bloquée (trop de redirections)"
 
-# ── Mémoire simple (éphémère) ───────────────────────────────────────
+# ── Vault : persistance git OPTIONNELLE de la mémoire ───────────────
+# Sans VAULT_REPO (ou sans GITHUB_TOKEN), rien ne change : mémoire
+# éphémère dans /tmp. Avec, la mémoire vit dans un clone du vault et
+# chaque `remember` est commité + poussé (best-effort).
+VAULT_REPO = os.environ.get("VAULT_REPO", "")   # ex: xelaproulx86-hash/ruche-memory-vault
+VAULT_DIR = os.environ.get("VAULT_DIR", "/tmp/ruche_vault")
+_VAULT_ACTIVE = False
+
+
+def _git_auth_env() -> dict[str, str]:
+    """Token via GIT_CONFIG_* : jamais dans argv (ps, messages d'erreur)."""
+    return dict(
+        os.environ,
+        GIT_CONFIG_COUNT="1",
+        GIT_CONFIG_KEY_0="http.extraHeader",
+        GIT_CONFIG_VALUE_0=f"Authorization: Bearer {GITHUB_TOKEN}",
+    )
+
+
+def _vault_git(*args: str) -> "subprocess.CompletedProcess[str]":
+    return subprocess.run(["git", "-C", VAULT_DIR, *args],
+                          env=_git_auth_env(), capture_output=True, text=True)
+
+
+def vault_init() -> str:
+    """Clone le vault et y déplace MEM_FILE. Erreurs assainies (le statut
+    est affiché publiquement dans /health)."""
+    global _VAULT_ACTIVE, MEM_FILE
+    if not VAULT_REPO:
+        return "vault désactivé (VAULT_REPO absent) — mémoire éphémère /tmp"
+    if not GITHUB_TOKEN:
+        return "vault désactivé (GITHUB_TOKEN absent) — mémoire éphémère /tmp"
+    if not shutil.which("git"):
+        return "vault désactivé (git introuvable) — mémoire éphémère /tmp"
+    shutil.rmtree(VAULT_DIR, ignore_errors=True)
+    proc = subprocess.run(
+        ["git", "clone", "--depth", "1",
+         f"https://github.com/{VAULT_REPO}.git", VAULT_DIR],
+        env=_git_auth_env(), capture_output=True, text=True,
+    )
+    if proc.returncode != 0:
+        log.warning("clone du vault en échec (git exit %s): %s",
+                    proc.returncode, proc.stderr.strip())
+        return f"vault en échec (git exit {proc.returncode}) — repli mémoire /tmp"
+    _vault_git("config", "user.email", "ruche-gateway@laruche.local")
+    _vault_git("config", "user.name", "ruche-gateway")
+    MEM_FILE = os.path.join(VAULT_DIR, "memory.json")
+    _VAULT_ACTIVE = True
+    return f"vault actif ({VAULT_REPO})"
+
+
+def _vault_push() -> None:
+    """Commit + push best-effort après une écriture (jamais bloquant :
+    un échec réseau laisse la copie locale intacte et se rattrape au
+    push suivant)."""
+    if not _VAULT_ACTIVE:
+        return
+    _vault_git("add", "memory.json")
+    c = _vault_git("commit", "-m", "ruche: mémoire mise à jour")
+    if c.returncode != 0:
+        return  # rien de nouveau à committer
+    p = _vault_git("push")
+    if p.returncode != 0:
+        log.warning("push du vault en échec: %s", p.stderr.strip())
+
+
+# ── Mémoire simple (vault si configuré, sinon éphémère) ─────────────
 _MEM_LOCK = threading.Lock()
 
 
@@ -316,6 +382,11 @@ def _mem_set(key: str, value: str) -> None:
         m = _mem()
         m[key] = value
         _mem_save(m)
+        _vault_push()
+
+
+VAULT_STATUS = vault_init()
+log.info("vault: %s", VAULT_STATUS)
 
 # ── Prompt système (regénéré à chaque appel — reflète les greffes) ──
 def _system_prompt() -> str:
@@ -472,6 +543,7 @@ def gateway_info() -> str:
         },
         "graft": GRAFT_STATUS,
         "hive_tools": sorted(HIVE_TOOLS.keys()),
+        "vault": VAULT_STATUS,
         "coût": "free=0$ · gpu≈0.69$/h facturé à la seconde, 0$ au repos (scale-to-zero)",
     }, ensure_ascii=False, indent=2)
 
@@ -493,6 +565,7 @@ def health() -> dict[str, Any]:
         "free_chain": [p.name for p in _free_available()],
         "graft": GRAFT_STATUS,
         "hive_tools": sorted(HIVE_TOOLS.keys()),
+        "vault": VAULT_STATUS,
     }
 
 

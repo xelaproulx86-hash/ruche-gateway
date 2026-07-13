@@ -12,7 +12,8 @@ RUCHE-GATEWAY v3.1
 ├─ T2: GPU RunPod (scale-to-zero — ne se reveille que si demande/necessaire)
 ├─ Greffe hivebase : charge des outils depuis un repo GitHub (dormante sans GITHUB_TOKEN)
 ├─ Garde SSRF : validation d'URL + verification de CHAQUE saut de redirection
-├─ Memoire ephemere : /tmp/ruche_memory.json (ecriture atomique, verrou)
+├─ Memoire : /tmp (ephemere) OU vault git persistant si VAULT_REPO est defini
+│            (ecriture atomique, verrou, commit+push best-effort)
 ├─ FastAPI : GET /ping · GET /health · GET /claude · POST /hook
 ├─ UI Gradio : 3 onglets (Tache agent, Chat direct, Etat)
 └─ Serveur MCP : /gradio_api/mcp/ (pont Claude Code / claude.ai / Cowork)
@@ -45,6 +46,7 @@ L'essentiel :
 | `RUNPOD_BASE_URL` / `RUNPOD_API_KEY` | T2 GPU (optionnel) |
 | `MODEL_NAME` | modele servi par RunPod (defaut Qwen 2.5 14B AWQ) |
 | `GITHUB_TOKEN` / `HIVE_REPO` | greffe d'outils hivebase (dormante sans token) |
+| `VAULT_REPO` | memoire persistante git, ex `xelaproulx86-hash/ruche-memory-vault` (sinon /tmp ephemere) |
 | `MAX_TASK_CHARS` | longueur max d'une tache/prompt (defaut 8000) |
 
 ## API
