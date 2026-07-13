@@ -1,0 +1,52 @@
+name: docker
+
+# Publie l'image CPU sur GHCR à chaque changement du runtime sur main.
+# Tags produits :
+#   ghcr.io/<owner>/ruche-gateway:latest        (pratique, mobile)
+#   ghcr.io/<owner>/ruche-gateway:sha-<commit>  (immuable — à utiliser
+#                                                pour les endpoints RunPod)
+on:
+  push:
+    branches: [main]
+    paths:
+      - app.py
+      - Dockerfile
+      - requirements.txt
+      - .github/workflows/docker.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build-push:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/metadata-action@v5
+        id: meta
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=raw,value=latest
+            type=sha,format=long,prefix=sha-
+      - uses: docker/build-push-action@v6
+        id: push
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+      - name: Print image references
+        run: |
+          echo "### Image publiée" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "ghcr.io/${{ github.repository }}:sha-${{ github.sha }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "ghcr.io/${{ github.repository }}@${{ steps.push.outputs.digest }}" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
