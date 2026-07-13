@@ -9,8 +9,10 @@ Image CPU pour endpoint RunPod load-balancing. Aucune cle dans le code (env only
 RUCHE-GATEWAY v3.1
 ├─ T1: cascade GRATUITE (SambaNova, Cerebras, Gemini, Mistral, NVIDIA, Groq)
 │      un provider sans cle est saute; un echec = cooldown 90 s
+├─ Conseil: tier=conseil → N cerveaux gratuits EN PARALLELE + 1 arbitre (0$)
 ├─ T2: GPU RunPod (scale-to-zero — ne se reveille que si demande/necessaire)
-├─ Greffe hivebase : charge des outils depuis un repo GitHub (dormante sans GITHUB_TOKEN)
+├─ Outils EMBARQUES : heure/calculer/meteo cuits dans l'image (sans token)
+├─ Greffe hivebase : ajoute d'autres outils depuis un repo GitHub (optionnelle)
 ├─ Garde SSRF : validation d'URL + verification de CHAQUE saut de redirection
 ├─ Memoire : /tmp (ephemere) OU vault git persistant si VAULT_REPO est defini
 │            (ecriture atomique, verrou, commit+push best-effort)
@@ -51,8 +53,9 @@ L'essentiel :
 
 ## API
 
-Tiers : `free` (gratuit seulement, 0$) · `gpu` (RunPod direct, ¢/s) ·
-`auto` (gratuit d'abord, GPU en dernier recours).
+Tiers : `free` (gratuit seulement, 0$) · `conseil` (N cerveaux gratuits en
+parallele + arbitre, 0$) · `gpu` (RunPod direct, ¢/s) · `auto` (gratuit
+d'abord, GPU en dernier recours).
 
 | Porte | Auth | Description |
 | ----- | ---- | ----------- |

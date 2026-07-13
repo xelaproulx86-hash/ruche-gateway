@@ -14,6 +14,7 @@
 # ══════════════════════════════════════════════════════════════════
 from __future__ import annotations
 
+import concurrent.futures
 import ipaddress
 import json
 import logging
@@ -89,6 +90,7 @@ FREE_CHAIN: list[Provider] = [
 ]
 COOLDOWN_SECONDS = 90.0
 _COOLDOWN: dict[str, float] = {}  # provider -> timestamp de fin de pénalité
+CONSEIL_ADVISORS = int(os.environ.get("CONSEIL_ADVISORS", "3"))  # nb de cerveaux consultés en parallèle
 
 
 def _free_available() -> list[Provider]:
@@ -112,9 +114,12 @@ def _call_openai_compat(base_url: str, api_key: str, model: str,
 def llm(messages: list[dict[str, str]], tier: str = "auto",
         max_tokens: int = 800) -> tuple[str, str]:
     """Cascade économique. Retourne (texte, 'provider').
-    tier='free' : gratuit seulement (erreur si tout est down).
-    tier='gpu'  : RunPod direct (¢/s — réveille un worker).
-    tier='auto' : gratuit d'abord, GPU en dernier recours."""
+    tier='free'    : gratuit seulement (erreur si tout est down).
+    tier='gpu'     : RunPod direct (¢/s — réveille un worker).
+    tier='auto'    : gratuit d'abord, GPU en dernier recours.
+    tier='conseil' : N cerveaux gratuits en parallèle + 1 arbitre (0$)."""
+    if tier == "conseil":
+        return _llm_conseil(messages, max_tokens)
     errors: list[str] = []
     if tier in ("free", "auto"):
         now = time.time()
@@ -141,6 +146,62 @@ def llm(messages: list[dict[str, str]], tier: str = "auto",
     raise RuntimeError(f"tier inconnu: {tier}")
 
 
+def _llm_conseil(messages: list[dict[str, str]], max_tokens: int = 800) -> tuple[str, str]:
+    """Mode conseil (« tri-brain ») : interroge plusieurs cerveaux gratuits EN
+    PARALLÈLE, puis un arbitre synthétise/tranche. Coût 0$. Repli sur la
+    cascade 'auto' si moins de 2 conseillers sont disponibles ou répondent."""
+    now = time.time()
+    avail = [p for p in _free_available() if _COOLDOWN.get(p.name, 0) <= now]
+    advisors = avail[:CONSEIL_ADVISORS]
+    if len(advisors) < 2:
+        return llm(messages, tier="auto", max_tokens=max_tokens)
+
+    opinions: list[tuple[str, str]] = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(advisors)) as ex:
+        futs = {ex.submit(_call_openai_compat, p.base_url, os.environ[p.key_env],
+                          p.model, messages, max_tokens): p for p in advisors}
+        for fut in concurrent.futures.as_completed(futs):
+            p = futs[fut]
+            try:
+                opinions.append((p.name, fut.result()))
+            except Exception as e:
+                _COOLDOWN[p.name] = now + COOLDOWN_SECONDS
+                log.warning("conseil: %s en échec: %s", p.name, e)
+
+    if not opinions:
+        return llm(messages, tier="auto", max_tokens=max_tokens)
+    if len(opinions) == 1:
+        name, text = opinions[0]
+        return text, f"conseil→{name} (seul répondant)"
+
+    # Arbitre : un provider frais (hors conseillers si possible) synthétise.
+    consulted = {n for n, _ in opinions}
+    arbiter = next((p for p in avail if p.name not in consulted), advisors[0])
+    joined = "\n\n".join(f"--- Réponse {i + 1} ({name}) ---\n{txt}"
+                         for i, (name, txt) in enumerate(opinions))
+    arb_messages = [
+        {"role": "system", "content":
+            "Tu es l'arbitre d'un conseil de plusieurs assistants IA. On te fournit la "
+            "requête d'origine puis plusieurs réponses indépendantes. Produis UNE seule "
+            "réponse consolidée, la plus juste et complète possible : corrige les erreurs, "
+            "tranche les désaccords, garde le meilleur de chacune. Conserve EXACTEMENT le "
+            "format attendu des réponses (si elles sont en JSON, réponds en JSON valide et "
+            "rien d'autre)."},
+        {"role": "user", "content":
+            f"Requête d'origine :\n{messages[-1]['content']}\n\n"
+            f"Réponses du conseil :\n{joined}\n\nRéponse consolidée :"},
+    ]
+    names = "+".join(n for n, _ in opinions)
+    try:
+        synth = _call_openai_compat(arbiter.base_url, os.environ[arbiter.key_env],
+                                    arbiter.model, arb_messages, max_tokens)
+        return synth, f"conseil({names})→{arbiter.name}"
+    except Exception as e:
+        log.warning("conseil: arbitre %s en échec: %s", arbiter.name, e)
+        best_name, best_text = max(opinions, key=lambda o: len(o[1]))
+        return best_text, f"conseil({names})→{best_name} (arbitre indispo)"
+
+
 # ── HIVEBASE: greffe des mains depuis GitHub (dormant sans GITHUB_TOKEN) ──
 import importlib
 import inspect
@@ -149,12 +210,19 @@ import shutil
 import subprocess
 import sys
 
+import builtin_tools
+
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
 HIVE_REPO = os.environ.get("HIVE_REPO", "xelaproulx86-hash/ruche")
 HIVE_MODULE = os.environ.get("HIVE_MODULE", "hivebase")
 HIVE_AUTOSCAN = os.environ.get("HIVE_AUTOSCAN", "0") == "1"  # défaut: TOOLS explicite seulement
 
-HIVE_TOOLS: dict[str, Callable[..., Any]] = {}  # name -> callable
+# Outils EMBARQUÉS (vendored, cuits dans l'image) : toujours présents dès le
+# démarrage, sans token ni réseau. La greffe GitHub s'ajoute/écrase par-dessus.
+HIVE_TOOLS: dict[str, Callable[..., Any]] = {
+    k: v for k, v in builtin_tools.TOOLS.items() if callable(v)
+}
+BUILTIN_TOOL_NAMES = sorted(HIVE_TOOLS)
 
 
 def _safe_str(x: Any, limit: int = 3000) -> str:
@@ -206,18 +274,18 @@ def _collect_public_functions(mod: Any) -> dict[str, Callable[..., Any]]:
 
 def graft_hivebase() -> str:
     """Défaut: seul un dict TOOLS explicite est exposé. HIVE_AUTOSCAN=1 pour scanner le package."""
-    global HIVE_TOOLS
     if not GITHUB_TOKEN:
-        return "pas de GITHUB_TOKEN — mains locales seulement"
+        return f"pas de GITHUB_TOKEN — {len(BUILTIN_TOOL_NAMES)} outils embarqués seulement ({', '.join(BUILTIN_TOOL_NAMES)})"
     dst = _clone_repo("/tmp/hive")
     if dst not in sys.path:
         sys.path.insert(0, dst)
     mod = importlib.import_module(HIVE_MODULE)
     if hasattr(mod, "TOOLS") and isinstance(getattr(mod, "TOOLS"), dict):
-        HIVE_TOOLS = {k: v for k, v in mod.TOOLS.items() if callable(v) and not str(k).startswith("_")}
-        return f"greffé (TOOLS): {', '.join(sorted(HIVE_TOOLS)) or 'aucune fonction'}"
+        grafted = {k: v for k, v in mod.TOOLS.items() if callable(v) and not str(k).startswith("_")}
+        HIVE_TOOLS.update(grafted)  # s'ajoute aux embarqués
+        return f"greffé (TOOLS): {', '.join(sorted(grafted)) or 'aucune fonction'} (+ {len(BUILTIN_TOOL_NAMES)} embarqués)"
     if not HIVE_AUTOSCAN:
-        return "repo cloné, mais pas de dict TOOLS exporté — ajoute TOOLS = {\"nom\": fn} dans hivebase (ou HIVE_AUTOSCAN=1)"
+        return f"repo cloné, mais pas de dict TOOLS exporté — {len(BUILTIN_TOOL_NAMES)} outils embarqués actifs (ajoute TOOLS = {{\"nom\": fn}} dans hivebase, ou HIVE_AUTOSCAN=1)"
     tools = _collect_public_functions(mod)
     if hasattr(mod, "__path__"):
         prefix = mod.__name__ + "."
@@ -228,8 +296,8 @@ def graft_hivebase() -> str:
             except Exception:
                 log.warning("greffe: import de %s impossible", name, exc_info=True)
                 continue
-    HIVE_TOOLS = tools
-    return f"greffé (autoscan): {', '.join(sorted(HIVE_TOOLS)) or 'aucune fonction trouvée'}"
+    HIVE_TOOLS.update(tools)  # s'ajoute aux embarqués
+    return f"greffé (autoscan): {', '.join(sorted(tools)) or 'aucune fonction trouvée'} (+ {len(BUILTIN_TOOL_NAMES)} embarqués)"
 
 
 GRAFT_STATUS = ""
@@ -543,8 +611,10 @@ def gateway_info() -> str:
         },
         "graft": GRAFT_STATUS,
         "hive_tools": sorted(HIVE_TOOLS.keys()),
+        "builtin_tools": BUILTIN_TOOL_NAMES,
         "vault": VAULT_STATUS,
-        "coût": "free=0$ · gpu≈0.69$/h facturé à la seconde, 0$ au repos (scale-to-zero)",
+        "conseil": f"{CONSEIL_ADVISORS} cerveaux gratuits en parallèle + arbitre (tier=conseil)",
+        "coût": "free/conseil=0$ · gpu≈0.69$/h facturé à la seconde, 0$ au repos (scale-to-zero)",
     }, ensure_ascii=False, indent=2)
 
 # ── Les portes HTTP historiques (compat v2.1 : téléphone, n8n, scripts) ──
@@ -565,6 +635,7 @@ def health() -> dict[str, Any]:
         "free_chain": [p.name for p in _free_available()],
         "graft": GRAFT_STATUS,
         "hive_tools": sorted(HIVE_TOOLS.keys()),
+        "builtin_tools": BUILTIN_TOOL_NAMES,
         "vault": VAULT_STATUS,
     }
 
@@ -597,13 +668,13 @@ with gr.Blocks(title="🐝 RUCHE-GATEWAY v3") as demo:
     with gr.Tab("Tâche (agent)"):
         t_task = gr.Textbox(label="Tâche", lines=4,
                             placeholder="Ex: Va lire https://example.com et résume en 3 points.")
-        t_tier = gr.Dropdown(["auto", "free", "gpu"], value="auto", label="Tier")
+        t_tier = gr.Dropdown(["auto", "free", "conseil", "gpu"], value="auto", label="Tier")
         t_token = gr.Textbox(label="Token", type="password")
         t_out = gr.Textbox(label="Résultat", lines=12)
         gr.Button("Lancer 🐝").click(ruche_task, [t_task, t_tier, t_token], t_out)
     with gr.Tab("Chat direct (1 appel)"):
         c_prompt = gr.Textbox(label="Prompt", lines=4)
-        c_tier = gr.Dropdown(["free", "auto", "gpu"], value="free", label="Tier")
+        c_tier = gr.Dropdown(["free", "conseil", "auto", "gpu"], value="free", label="Tier")
         c_token = gr.Textbox(label="Token", type="password")
         c_out = gr.Textbox(label="Réponse", lines=12)
         gr.Button("Envoyer").click(ruche_chat, [c_prompt, c_tier, c_token], c_out)
