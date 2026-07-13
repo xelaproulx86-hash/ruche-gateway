@@ -1,0 +1,20 @@
+[project]
+name = "ruche-gateway"
+version = "3.1.0"
+description = "Gateway La Ruche : cascade économique (gratuit → GPU RunPod) + serveur MCP"
+requires-python = ">=3.11"
+dependencies = [
+    "gradio[mcp]>=5.28",
+    "fastapi",
+    "uvicorn",
+    "requests",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
